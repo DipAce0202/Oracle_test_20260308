@@ -1,1 +1,105 @@
+name: Launch Oracle Ampere Instance
 
+on:
+  workflow_dispatch:
+    inputs:
+      retry_count:
+        description: 'Max retries for capacity errors'
+        required: false
+        default: '10'
+
+jobs:
+  launch-instance:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Install OCI CLI
+        run: |
+          python3 -m pip install oci-cli
+
+      - name: Setup OCI Config Directory
+        run: |
+          mkdir -p ~/.oci
+          chmod 700 ~/.oci
+
+      - name: Write OCI Private Key
+        run: |
+          echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+      - name: Write OCI Config File
+        run: |
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+
+      - name: Launch Ampere Instance with Retry Logic
+        env:
+          COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          SUBNET_ID: ${{ secrets.OCI_SUBNET_OCID }}
+          AD: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          IMAGE_ID: ${{ secrets.OCI_IMAGE_OCID }}
+          SSH_KEY: ${{ secrets.MY_PUBLIC_SSH_KEY }}
+          MAX_RETRIES: ${{ github.event.inputs.retry_count }}
+        run: |
+          #!/bin/bash
+          set -e
+          
+          RETRY_COUNT=0
+          SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "========================================="
+            echo "Attempt $((RETRY_COUNT + 1)) of $MAX_RETRIES..."
+            echo "========================================="
+            
+            OUTPUT=$(oci compute instance launch \
+              --compartment-id $COMPARTMENT_ID \
+              --availability-domain $AD \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus": 1, "memoryInGBs": 6}' \
+              --image-id $IMAGE_ID \
+              --subnet-id $SUBNET_ID \
+              --display-name "GitHub-Ampere-$(date +%s)" \
+              --metadata "{\"ssh_authorized_keys\": \"$SSH_KEY\"}" \
+              --create-vnic-details '{"assignPublicIp": "true"}' \
+              --wait-for-state RUNNING \
+              --max-wait-seconds 300 \
+              2>&1) || true
+
+            if echo "$OUTPUT" | grep -q '"lifecycle-state": "RUNNING"'; then
+              echo "✅ SUCCESS: Instance is RUNNING"
+              PUBLIC_IP=$(echo "$OUTPUT" | grep -o '"public-ip": "[^"]*"' | head -1 | cut -d'"' -f4)
+              echo "========================================="
+              echo "🌍 Public IP: $PUBLIC_IP"
+              echo "========================================="
+              echo "SSH Command: ssh -i ~/.ssh/id_rsa opc@$PUBLIC_IP"
+              echo "========================================="
+              SUCCESS=true
+              break
+            else
+              echo "❌ Failed or Out of Capacity."
+              if echo "$OUTPUT" | grep -q "out of capacity"; then
+                echo "⏳ Waiting 60 seconds before retry..."
+                sleep 60
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+              else
+                echo "🚨 Critical Error (not capacity):"
+                echo "$OUTPUT"
+                exit 1
+              fi
+            fi
+          done
+
+          if [ "$SUCCESS" = false ]; then
+            echo "⚠️ Failed to launch after $MAX_RETRIES attempts."
+            exit 1
+          fi
